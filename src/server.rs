@@ -10,8 +10,9 @@ use axum::{
     Router
 };
 use std::{sync::Arc, net::{SocketAddr, IpAddr}, collections::HashMap};
+use std::time::Duration;
 use anyhow::{Result, bail};
-use tokio::time::{sleep, Duration};
+use tokio::time::sleep;
 use tokio::sync::Mutex;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -19,10 +20,10 @@ use tracing::{error, debug};
 use serde::Serialize;
 use tower::ServiceBuilder;
 
-use crate::nodes::Node;
-
-use super::opax::{OpaxResponse, OpaxRequest, OpaxMessage, OpaxEntry, OpaxEntryKey};
+use super::nodes::ClusterNode;
 use super::storage::OPAX_RESERVED_KEYS;
+use super::opax::{OpaxResponse, OpaxRequest, OpaxMessage, OpaxEntry, OpaxEntryKey,
+    OpaxQuery};
 
 
 #[derive(Clone)]
@@ -36,8 +37,9 @@ pub struct HttpServer {
     pub node_id: u64,
     pub peers: HashMap<u64, PeerNode>,
     pub clients: Vec<IpAddr>,
+    pub cache_life: Duration,
     inbox: Arc<Mutex<Vec<OpaxMessage>>>,
-    responses: Arc<Mutex<HashMap<OpaxRequest, Option<OpaxResponse>>>>
+    responses: Arc<Mutex<Vec<OpaxQuery>>>
 }
 
 impl HttpServer {
@@ -50,12 +52,81 @@ impl HttpServer {
         
         messages
     }
+    /// Check if response can be returned from the cache
+    pub async fn get_cached(&mut self, req: &OpaxRequest) -> Option<OpaxQuery> {
+        let cache = self.responses.lock().await;
+
+        cache.iter().find(|q|q.request.eq(req)).cloned()
+            .and_then(|q| match q.is_older_than(&self.cache_life) {
+                true => None,
+                false => Some(q),
+            })
+    }
+    pub async fn wipe_cache(&mut self, req: &OpaxRequest, resp: &OpaxResponse) {
+        let mut cache = self.responses.lock().await;
+
+        // Keys are of interest here. If key is deleted or its value modified we should
+        // wipe get responses along with the existing put / delete response.
+        match req {
+            OpaxRequest::Delete(k) => cache.retain(|q| match q.request {
+                // Keep delete query matching request and response, delete others
+                // where delete request key matches the given request's key
+                OpaxRequest::Delete(ref k) => match q.request.eq(req) {
+                    true => match q.response.eq(resp) {
+                        true => true,
+                        false => q.request.key().ne(k),
+                    },
+                    false => true,
+                },
+                // If key is deleted get rid of cached get and put responses
+                // pointing at the deleted key
+                OpaxRequest::Get(ref s) => s.ne(k),
+                OpaxRequest::Put(ref e) => e.key.ne(k),
+                _ => true,
+            }),
+            OpaxRequest::Put(e) => cache.retain(|q| match q.request {
+                // As above, only targeting cached put responses instead of delete
+                OpaxRequest::Put(ref e) => match q.request.eq(req) {
+                    true => match q.response.eq(resp) {
+                        true => true,
+                        false => q.request.key().ne(&e.key),
+                    },
+                    false => true,
+                },
+                // Also as above but get rid of cached delete responses
+                OpaxRequest::Get(ref s) => s.ne(&e.key),
+                OpaxRequest::Delete(ref s) => s.ne(&e.key),
+                _ => true,
+            }),
+            x => panic!("Stupid developer only wipe cache on put or \
+                delete DB actions. You're feeding request of type {:?}", x),
+        }
+    }
     pub async fn receiver(&self, message: OpaxMessage) {
         match message {
-            // API requests done by the server are expected to have request reference
-            // in their response.
-            OpaxMessage::APIResponse(ref k, ref v) => if let Some(r) = v {
-                self.responses.lock().await.insert(r.to_owned(), Some(k.to_owned()));
+            // API response is added to the cache if it's not there already. Requests
+            // that are identical produce identical responses.
+            OpaxMessage::APIResponse(ref q) => {
+                let mut responses = self.responses.lock().await;
+                
+                match responses.iter().enumerate().find(|(_, i)|i.request.eq(&q.request)) {
+                    Some((i, x)) => match x.is_older_than(&self.cache_life) {
+                        true => {
+                            responses.remove(i);
+                            responses.push(q.to_owned());
+
+                            debug!("Reloading API response for {} to cache", q.request);
+                        },
+                        false => {
+                            debug!("Loading API response for {} from cache", q.request);
+                        }
+                    },
+                    None => {
+                        debug!("Storing API response for {} to cache", q.request);
+                        responses.push(q.to_owned());
+                    }
+                }
+
                 return
             },
             _ => (),
@@ -63,12 +134,12 @@ impl HttpServer {
 
         self.inbox.lock().await.push(message);
     }
-    pub async fn new(node: Node, peers: &HashMap<u64, String>) -> Result<Self> {
+    pub async fn new(node: ClusterNode, peers: &HashMap<u64, String>) -> Result<Self> {
         let ip = node.addr.parse::<SocketAddr>()?;
         let messages = Arc::new(Mutex::new(vec![]));
         let inbox = messages.clone();
 
-        let api_response = Arc::new(Mutex::new(HashMap::new()));
+        let api_response = Arc::new(Mutex::new(vec![]));
         let responses = api_response.clone();
 
         let peers = peers.iter()
@@ -82,7 +153,8 @@ impl HttpServer {
             None => vec!["127.0.0.1".parse().unwrap()],
         };
 
-        let server = Self { node_id: node.id, inbox, responses, peers, clients };
+        let server = Self { node_id: node.id, inbox, responses, peers,
+            clients, cache_life: node.cache };
         let state = server.clone();
 
         tokio::spawn(async move {
@@ -264,7 +336,7 @@ async fn client_ws(socket: WebSocket, state: State<HttpServer>) {
 
         let (apiresp, req) = match opax_message {
             OpaxMessage::APIRequest(r) => (
-                response_lookout(state.clone(), &r).await, r
+                response_listener(state.clone(), &r).await, r
             ),
             x => {
                 error!("Client socket received unsupported message type: {:?}", x);
@@ -523,30 +595,21 @@ async fn ping_handler(state: State<HttpServer>) -> Json<APIRespFormat> {
 }
 
 async fn responder(state: State<HttpServer>, req: OpaxRequest, key: String) -> APIResp {
-    match response_lookout(state, &req).await {
+    match response_listener(state, &req).await {
         Some(r) => APIResp::from_opax(&r),
         None => APIResp::to_error(key, "Request timed out"),
     }
 }
 
-async fn response_lookout(state: State<HttpServer>, req: &OpaxRequest) -> Option<OpaxResponse> {
+async fn response_listener(state: State<HttpServer>, req: &OpaxRequest) -> Option<OpaxResponse> {
     let interval = 50 as u64;
     let mut timeout = 3000 as u64;
 
     while timeout > 0 {
-        sleep(Duration::from_millis(50)).await;
-        let mut map = state.responses.lock().await;
+        let cache = state.responses.lock().await;
 
-        if let Some(o) = map.get(req) {
-            if let Some(r) = o {
-                let resp = Some(r.to_owned());
-
-                if map.remove(req).is_none() {
-                    error!("Failed to destroy response from the queue");
-                }
-                
-                return resp
-            }
+        if let Some(q) = cache.iter().find(|q|q.request.eq(&req)) {
+            return Some(q.response.to_owned())
         }
         
         timeout = timeout - interval;
@@ -554,6 +617,8 @@ async fn response_lookout(state: State<HttpServer>, req: &OpaxRequest) -> Option
         if [500, 1500, 2000, 2500].contains(&timeout) {
             debug!("Waiting for response: {:?}...", req);
         }
+
+        sleep(Duration::from_millis(50)).await;
     }
     
     None

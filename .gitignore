@@ -1,1 +1,10 @@
 /target
+
+/example/data_1/commitlog
+/example/data_1/database
+
+/example/data_2/commitlog
+/example/data_2/database
+
+/example/data_3/commitlog
+/example/data_3/database

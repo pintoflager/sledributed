@@ -27,14 +27,17 @@ _Default logging level is DEBUG and after each command at least the targeted nod
 On the fourth terminal window start running curl commands:
 #### Try to get key value pair from the first node
 ```curl -X GET -H "Content-Type: application/json" http://127.0.0.1:8080/key/eat```
+
 expected failure:```{"Single":{"key":"eat","exists":false}}```
 
 #### Insert key value pair to the second node
 ```curl -X POST -H "Content-Type: application/json" -d '{"key":"eat","value":"it"}' http://127.0.0.1:8081/key```
+
 expected success:```{"Single":{"key":"eat","value":"it"}}```
 
 #### Get inserted key value pair from the third node
 ```curl -X GET -H "Content-Type: application/json" http://127.0.0.1:8082/key/eat```
+
 expected success:```{"Single":{"key":"eat","exists":true,"value":"it"}}```
 
 Now you could kill off one of the nodes to see if your cluster remains on the road without it.
@@ -44,12 +47,14 @@ Open terminal window for node 2 (listening on address 127.0.0.1:8081) and hit ``
 Getting keys from the remaining nodes should work even if we're down to one node.
 
 ```curl -X GET -H "Content-Type: application/json" http://127.0.0.1:8080/key/eat```
+
 expected success:```{"Single":{"key":"eat","exists":true,"value":"it"}}```
 
 #### Insert another key value pair to the third node
 Inserting keys should work if we have 2 out of 3 nodes online and connected.
 
 ```curl -X POST -H "Content-Type: application/json" -d '{"key":"duck","value":"you"}' http://127.0.0.1:8082/key```
+
 expected success:```{"Single":{"key":"duck","value":"you"}}```
 
 If you bring up your node 2 again we can test if it picks up the changes after reconnecting to its peers.
@@ -61,6 +66,7 @@ You should see a message of snapshotted key value pairs being inserted.
 This node was offline when key was inserted to third node.
 
 ```curl -X GET -H "Content-Type: application/json" http://127.0.0.1:8081/key/duck```
+
 expected success:```{"Single":{"key":"duck","exists":true,"value":"you"}}```
 
 Kill 2 out of three nodes and see what happens when 'quorum' is lost.
@@ -71,10 +77,12 @@ Open terminal window for node 3 (listening on address 127.0.0.1:8082) and hit ``
 Inserting keys should not work if we have 1 out of 3 nodes online.
 
 ```curl -X POST -H "Content-Type: application/json" -d '{"key":"in_your","value":"maze"}' http://127.0.0.1:8080/key```
+
 expected failure:```{"Single":{"key":"in_your","error":"Action was blocked as too many cluster nodes have disconnected. Operation is permitted once more than half of the cluster nodes have returned"}}```
 
 #### Try to get key and value from the first node
 ```curl -X GET -H "Content-Type: application/json" http://127.0.0.1:8080/key/eat```
+
 expected success:```{"Single":{"key":"eat","exists":true,"value":"it"}}```
 
 Connect nodes 2 and 3 again to try deletes and bulk actions.
@@ -83,6 +91,7 @@ Go back to third terminal window and run ```cargo run example/data_3```
 
 #### Insert multiple key value pairs to the first node
 ```curl -X POST -H "Content-Type: application/json" -d '[{"key":"goto","value":"dell"},{"key":"up","value":"doors"}]' http://127.0.0.1:8080/keys```
+
 expected success:```{"Multiple":[{"key":"goto","value":"dell"},{"key":"up","value":"doors"}]}```
 
 #### Get multiple keys from second node
@@ -95,6 +104,7 @@ expected success:```{"Single":{"key":"in_your","exists":true,"overwritten_value"
 
 #### Delete multiple keys from the third node
 ```curl -X DELETE -H "Content-Type: application/json" -d '["eat","goto"]' http://127.0.0.1:8082/keys```
+
 expected success:```{"Multiple":[{"key":"eat","exists":true,"overwritten_value":"it"},{"key":"goto","exists":true,"overwritten_value":"dell"}]}```
 
 
@@ -102,6 +112,7 @@ expected success:```{"Multiple":[{"key":"eat","exists":true,"overwritten_value":
 Run the same command for ports 8081 and 8082 to see how their peers pong.
 
 ```curl -X GET  http://127.0.0.1:8080/ping```
+
 expected success:```{"Multiple":[{"key":"3","value":"Pinged peer node 3 successfully"},{"key":"2","value":"Pinged peer node 2 successfully"}]}```
 
 ### Run any command through client websocket
@@ -113,5 +124,5 @@ If you choose to play with websocat connect to node 1:
 Insert command to send as json string and hit enter:
 ```{"APIRequest":{"Get":"duck"}}```
 
-Response comes below the command when server is done.
+Response appears below the command once server is done scrathing its head.
 expected success:```{"request":{"Get":"duck"},"response":{"Get":{"key":"duck","value":"you"}}}```

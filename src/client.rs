@@ -98,11 +98,6 @@ impl HttpClient {
                 self.disconnected.lock().await.insert(receiver, 0);
             }
         }
-        // TODO: debugginh
-        // else {
-        //     error!("No open socket to receiver peer {}. Failed to send message {:?}",
-        //         receiver, message);
-        // }
     }
     pub fn connect(&self) {
         let connecting = self.disconnected.clone();

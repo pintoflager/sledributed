@@ -1,32 +1,60 @@
 use omnipaxos::{ClusterConfig, ServerConfig, OmniPaxosConfig};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use std::env;
 use tracing::info;
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 use tokio::fs::{read_to_string, create_dir_all};
 
-use crate::storage::OPAX_RESERVED_KEYS;
-
-use super::storage::{PersistentStorageConfig, PersistentStorage};
+use super::storage::OPAX_RESERVED_KEYS;
 use super::opax::{OpaxRequest, OpaxEntry};
 
 const NODE_CONFIG_FILE_NAME: &str = "node.toml";
 const SUBDIR_DATABASE: &str = "database";
 
+enum CacheTime {
+    S(u64),
+    M(u64),
+    H(u64),
+    D(u64)
+}
+
+impl CacheTime {
+    fn from_str(val: &str, amount: u64) -> Self {
+        match val.to_lowercase().as_str() {
+            "s" => Self::S(amount),
+            "m" => Self::M(amount),
+            "h" => Self::H(amount),
+            "d" => Self::D(amount),
+            x => panic!("Unknown time unit '{}' given", x),
+        }
+    }
+    fn as_duration(&self) -> Duration {
+        match self {
+            Self::S(u) => Duration::from_secs(*u),
+            Self::M(u) => Duration::from_secs(*u * 60),
+            Self::H(u) => Duration::from_secs(*u * 60 * 60),
+            Self::D(u) => Duration::from_secs(*u * 60 * 60 * 24),
+        }
+    }
+}
+
 #[derive(Deserialize)]
-pub struct Node {
+pub struct ClusterNode {
     #[serde(skip)]
     pub id: u64,
+    #[serde(skip)]
+    pub cache: Duration,
     pub addr: String,
     pub clients: Option<Vec<String>>,
+    pub cache_time: Option<String>,
     priority: Option<u32>,
     peers: Vec<String>,
 }
 
-impl Node {
+impl ClusterNode {
     pub async fn new(dir: &PathBuf) -> Result<(OmniPaxosConfig, HashMap<u64, String>, Self)> {
         let mut file = dir.to_owned();
         file.push(NODE_CONFIG_FILE_NAME);
@@ -34,7 +62,7 @@ impl Node {
         let mut node = match file.is_file() {
             true => {
                 let content = read_to_string(file).await?;
-                let node = toml::from_str::<Node>(&content)?;
+                let node = toml::from_str::<ClusterNode>(&content)?;
                 node
             },
             false => {
@@ -60,8 +88,10 @@ impl Node {
                     }
                 }
     
-                Node {
+                Self {
                     id: 0,
+                    cache: Duration::from_secs(0),
+                    cache_time: None,
                     addr: match pid {
                         Some(u) => u,
                         None => bail!("--addr or -a flag with node index was not found"),
@@ -75,6 +105,24 @@ impl Node {
                     }
                 }
             }
+        };
+
+        // Determine cache lifetime
+        node.cache = match node.cache_time {
+            Some(ref s) => match s.len() >= 2 {
+                true => {
+                    let (a, u) = s.split_at(s.len() - 1);
+                    let amount = match a.parse::<u64>() {
+                        Ok(u) => u,
+                        Err(e) => panic!("Failed to read time unit as \
+                            number: {}", e),
+                    };
+
+                    CacheTime::from_str(u, amount).as_duration()
+                },
+                false => panic!("Cache time should be a integer and time unit s,m,h or d"),
+            },
+            None => Duration::from_secs(60 * 60 * 5), // 5 hours
         };
         
         // Collect all node addresses and sort the results to have indexes match
@@ -130,12 +178,94 @@ impl Node {
     }
 }
 
-pub struct Database {
+pub struct NodeDatabase {
     sled: Db,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DBResponse {
+impl NodeDatabase {
+    pub fn open(dir: &PathBuf) -> Result<Self> {
+        let config = Config::new().path(dir);
+        let db = match Config::open(&config) {
+            Ok(d) => d,
+            Err(e) => bail!("Failed to load sled DB for omnipaxos: {}", e),
+        };
+
+        Ok(Self { sled: db })
+    }
+    pub fn sled_ref(&self) -> &Db {
+        &self.sled
+    }
+    pub fn action(&self, request: &OpaxRequest, allow_opax_keys: bool) -> Result<DBQueryResult> {
+        match request {
+            OpaxRequest::Put(OpaxEntry { key, value }) => {
+                match DBQueryResult::key_denied(key, allow_opax_keys) {
+                    Some(e) => Ok(e),
+                    None => self.put(key, value),
+                }
+            }
+            OpaxRequest::Delete(key) => match DBQueryResult::key_denied(key, allow_opax_keys) {
+                Some(e) => Ok(e),
+                None => self.delete(key)
+            }
+            OpaxRequest::Get(key) => match DBQueryResult::key_denied(key, allow_opax_keys) {
+                Some(e) => Ok(e),
+                None => self.get(key)
+            },
+            x => panic!("Unsupported action requested {:?}", x)
+        }
+    }
+    fn get(&self, key: &str) -> Result<DBQueryResult> {
+        let ivec = match self.sled.get(key.as_bytes()) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(DBQueryResult::new(key)),
+            Err(e) => bail!("failed to get value: {}", e),
+        };
+
+        match String::from_utf8(ivec.to_vec()) {
+            Ok(v) => {
+                let mut resp = DBQueryResult::new(key);
+                resp.set_value(v);
+
+                Ok(resp)
+            },
+            Err(e) => bail!("Failed to read value from {} as string: {}",
+                key, e),
+        }
+    }
+    fn put(&self, key: &str, value: &str) -> Result<DBQueryResult> {
+        match self.sled.insert(key.as_bytes(), value.as_bytes()) {
+            Ok(o) => {
+                let mut resp = DBQueryResult::new(key);
+                resp.set_value(value);
+
+                if let Some(i) = o {
+                    let ow = String::from_utf8_lossy(&i);
+                    resp.set_overwritten_val(ow);
+                }
+
+                Ok(resp)
+            },
+            Err(e) => bail!("failed to put value: {}", e),
+        }
+    }
+    fn delete(&self, key: &str) -> Result<DBQueryResult> {
+        match self.sled.remove(key.as_bytes()) {
+            Ok(o) => {
+                let mut resp = DBQueryResult::new(key);
+                if let Some(i) = o {
+                    let ow = String::from_utf8_lossy(&i);
+                    resp.set_overwritten_val(ow);
+                }
+
+                Ok(resp)
+            },
+            Err(e) => bail!("failed to delete value: {}", e),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct DBQueryResult {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -145,7 +275,7 @@ pub struct DBResponse {
     pub error: Option<String>,
 }
 
-impl DBResponse {
+impl DBQueryResult {
     fn new<T>(key: T) -> Self where T: Into<String> {
         Self { key: key.into(), value: None, overwritten_val: None, error: None }
     }
@@ -170,111 +300,11 @@ impl DBResponse {
     }
 }
 
-impl Database {
-    pub fn open(dir: &PathBuf) -> Result<Self> {
-        let config = Config::new().path(dir);
-        let db = match Config::open(&config) {
-            Ok(d) => d,
-            Err(e) => bail!("Failed to load sled DB for omnipaxos: {}", e),
-        };
-
-        Ok(Self { sled: db })
-    }
-    pub fn sled_ref(&self) -> &Db {
-        &self.sled
-    }
-    pub fn action(&self, request: &OpaxRequest, allow_opax_keys: bool) -> Result<DBResponse> {
-        match request {
-            OpaxRequest::Put(OpaxEntry { key, value }) => {
-                match DBResponse::key_denied(key, allow_opax_keys) {
-                    Some(e) => Ok(e),
-                    None => self.put(key, value),
-                }
-            }
-            OpaxRequest::Delete(key) => match DBResponse::key_denied(key, allow_opax_keys) {
-                Some(e) => Ok(e),
-                None => self.delete(key)
-            }
-            OpaxRequest::Get(key) => match DBResponse::key_denied(key, allow_opax_keys) {
-                Some(e) => Ok(e),
-                None => self.get(key)
-            },
-            x => panic!("Unsupported action requested {:?}", x)
-        }
-    }
-    fn get(&self, key: &str) -> Result<DBResponse> {
-        let ivec = match self.sled.get(key.as_bytes()) {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(DBResponse::new(key)),
-            Err(e) => bail!("failed to get value: {}", e),
-        };
-
-        match String::from_utf8(ivec.to_vec()) {
-            Ok(v) => {
-                let mut resp = DBResponse::new(key);
-                resp.set_value(v);
-
-                Ok(resp)
-            },
-            Err(e) => bail!("Failed to read value from {} as string: {}",
-                key, e),
-        }
-    }
-    fn put(&self, key: &str, value: &str) -> Result<DBResponse> {
-        match self.sled.insert(key.as_bytes(), value.as_bytes()) {
-            Ok(o) => {
-                let mut resp = DBResponse::new(key);
-                resp.set_value(value);
-
-                if let Some(i) = o {
-                    let ow = String::from_utf8_lossy(&i);
-                    resp.set_overwritten_val(ow);
-                }
-
-                Ok(resp)
-            },
-            Err(e) => bail!("failed to put value: {}", e),
-        }
-    }
-    fn delete(&self, key: &str) -> Result<DBResponse> {
-        match self.sled.remove(key.as_bytes()) {
-            Ok(o) => {
-                let mut resp = DBResponse::new(key);
-                if let Some(i) = o {
-                    let ow = String::from_utf8_lossy(&i);
-                    resp.set_overwritten_val(ow);
-                }
-
-                Ok(resp)
-            },
-            Err(e) => bail!("failed to delete value: {}", e),
-        }
-    }
-}
-
-pub fn init_storage(dir: &PathBuf, sled: &Db) -> Result<PersistentStorage<OpaxRequest>> {
-    let config  = PersistentStorageConfig::new(dir, sled)?;
-    
-    // extern crate commitlog:
-    // LogOptions {
-    //     log_dir: PathBuf,
-    //     log_max_bytes: usize,
-    //     index_max_bytes: usize,
-    //     message_max_bytes: usize,
-    // }
-    // config.set_commitlog_options(commitlog_opts)
-
-
-    // config.set_database_options(opts)
-
-    Ok(PersistentStorage::open(config)?)
-}
-
-pub async fn init_database(dir: &PathBuf) -> Result<Database> {
+pub async fn init_database(dir: &PathBuf) -> Result<NodeDatabase> {
     let mut db_path = dir.to_owned();
     db_path.push(SUBDIR_DATABASE);
 
     create_dir_all(&db_path).await?;
 
-    Database::open(&db_path)
+    NodeDatabase::open(&db_path)
 }

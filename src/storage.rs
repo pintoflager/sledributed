@@ -8,6 +8,8 @@ use anyhow::{Result, bail};
 use std::{iter::FromIterator, marker::PhantomData, path::PathBuf, fs::create_dir_all};
 use zerocopy::{AsBytes, FromBytes};
 
+use super::opax::OpaxRequest;
+
 const SUBDIR_COMMITLOG: &str = "commitlog";
 
 // REMEMBER: Moved to the slice below to block API requests to omnipaxos internal keys.
@@ -387,4 +389,22 @@ impl<T: Entry> Default for MemoryStorage<T> {
             stopsign: None,
         }
     }
+}
+
+pub fn init_storage(dir: &PathBuf, sled: &Db) -> Result<PersistentStorage<OpaxRequest>> {
+    let config  = PersistentStorageConfig::new(dir, sled)?;
+    
+    // extern crate commitlog:
+    // LogOptions {
+    //     log_dir: PathBuf,
+    //     log_max_bytes: usize,
+    //     index_max_bytes: usize,
+    //     message_max_bytes: usize,
+    // }
+    // config.set_commitlog_options(commitlog_opts)
+
+
+    // config.set_database_options(opts)
+
+    Ok(PersistentStorage::open(config)?)
 }

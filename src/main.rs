@@ -10,7 +10,8 @@ use tokio::fs::create_dir_all;
 use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use nodes::{Node, init_database, init_storage};
+use nodes::{ClusterNode, init_database};
+use storage::init_storage;
 use opax::OpaxServer;
 use server::HttpServer;
 use client::HttpClient;
@@ -41,7 +42,7 @@ async fn main() {
 
     create_dir_all(&dir).await.expect(&format!("Failed to create data dir {:?}", &dir));
 
-    let (config, map, node) = match Node::new(&dir).await {
+    let (config, map, node) = match ClusterNode::new(&dir).await {
         Ok(c) => c,
         Err(e) => panic!("Unable to load node config: {}", e),
     };

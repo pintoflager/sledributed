@@ -6,25 +6,27 @@ use omnipaxos::storage::{Entry, Snapshot};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio::time;
-use tracing::{debug, error};
+use std::fmt;
+use std::time::SystemTime;
+use tracing::{debug, error, warn};
 
-use crate::nodes::DBResponse;
+use crate::nodes::DBQueryResult;
 
 use super::client::HttpClient;
-use super::nodes::Database;
+use super::nodes::NodeDatabase;
 use super::storage::PersistentStorage;
 use super::server::HttpServer;
 
 // Masked string type for human readers
 pub type OpaxEntryKey = String;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct OpaxEntry {
     pub key: OpaxEntryKey,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum OpaxRequest {
     Put(OpaxEntry),
     Delete(OpaxEntryKey),
@@ -32,28 +34,80 @@ pub enum OpaxRequest {
     Ping(u64)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Display for OpaxRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Get(s) => write!(f, "GET key {} request", s),
+            Self::Put(e) => write!(f, "PUT key {} request", e.key),
+            Self::Delete(s) => write!(f, "DELETE key {} request", s),
+            Self::Ping(u) => write!(f, "PING peer {} request", u),
+        }
+    }
+}
+
+impl OpaxRequest {
+    pub fn key(&self) -> String {
+        match self {
+            Self::Delete(s) => s.to_owned(),
+            Self::Get(s) => s.to_owned(),
+            Self::Put(e) => e.key.to_owned(),
+            Self::Ping(u) => format!("{}", u),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum OpaxResponse {
     Decided(u64),
-    Get(DBResponse),
-    Put(DBResponse),
-    Delete(DBResponse),
+    Get(DBQueryResult),
+    Put(DBQueryResult),
+    Delete(DBQueryResult),
     Pong((u64, String)),
     Blocked(OpaxRequest)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpaxQuery {
+    timestamp: SystemTime,
+    pub request: OpaxRequest,
+    pub response: OpaxResponse,
+}
+
+impl OpaxQuery {
+    pub fn is_older_than(&self, duration: &Duration) -> bool {
+        let sys_time = SystemTime::now();
+        
+        match sys_time.duration_since(self.timestamp) {
+            Ok(d) => d.gt(duration),
+            Err(e) => {
+                error!("Failed to compare query timestamp \
+                    value and current time: {}", e);
+                false
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OpaxMessage {
     Internal(Message<OpaxRequest>),
     APIRequest(OpaxRequest),
-    APIResponse(OpaxResponse, Option<OpaxRequest>),
+    APIResponse(OpaxQuery)
+}
+
+impl OpaxMessage {
+    fn api_response(req: OpaxRequest, resp: OpaxResponse) -> Self {
+        let timestamp = SystemTime::now();
+
+        Self::APIResponse(OpaxQuery { timestamp, request: req, response: resp })
+    }
 }
 
 pub struct OpaxServer {
     pub omni_paxos: OmniPaxos<OpaxRequest, PersistentStorage<OpaxRequest>>,
     pub http_server: HttpServer,
     pub http_client: HttpClient,
-    pub database: Database,
+    pub database: NodeDatabase,
     pub last_decided_idx: u64,
 }
 
@@ -67,62 +121,84 @@ impl OpaxServer {
     async fn process_incoming_msgs(&mut self) {
         for message in self.http_server.get_received().await {
             match message {
-                OpaxMessage::APIRequest(r) => self.api_request(r).await,
+                OpaxMessage::APIRequest(r) => self.handle_api_req(r).await,
                 OpaxMessage::Internal(m) => {
                     self.omni_paxos.handle_incoming(m);
                 },
-                OpaxMessage::APIResponse(r, _) => {
-                    error!("Received an API response on the inbox: {:?}", r);
+                OpaxMessage::APIResponse(r) => {
+                    error!("Received an API response to inbox: {:?}", r);
                 }
             }
         }
     }
-    /// Request to API that responds by writing back to the client socket when message
-    /// comes up on outgoing message queue. 
-    async fn api_request(&mut self, req: OpaxRequest) {
+    /// Handle incoming API requests, responding from cache first if possible
+    async fn handle_api_req(&mut self, req: OpaxRequest) {
         match req {
             OpaxRequest::Get(ref k) => {
+                // For cached get requests we can forget DB query.
+                if self.http_server.get_cached(&req).await.is_some() {
+                    debug!("Serving get request response for key {} from cache", k);
+                    return
+                }
+                
                 let d = match self.database.action(&OpaxRequest::Get(k.clone()), false) {
                     Ok(d) => d,
                     Err(e) => panic!("Database get action failed: {}", e),
                 };
-                let response = OpaxResponse::Get(d);
-                let message = OpaxMessage::APIResponse(response, Some(req));
-                
-                self.http_server.receiver(message).await;
+
+                let response = OpaxMessage::api_response(req, OpaxResponse::Get(d));
+                self.http_server.receiver(response).await;
             },
             OpaxRequest::Put(ref x) => {
                 let req = OpaxRequest::Put(x.to_owned());
 
-                if let Err(e) = self.omni_paxos.append(req.to_owned()) {
-                    error!("Failed to append PUT request to replicated log: {:?}", e);
-                }
-
                 if ! self.http_client.quorum().await {
-                    let response = OpaxResponse::Blocked(req.to_owned());
-                    let message = OpaxMessage::APIResponse(response, Some(req));
+                    warn!("Cluster detected lost quorum");
+
+                    let resp = OpaxResponse::Blocked(req.to_owned());
+                    let message = OpaxMessage::api_response(req, resp);
                     
                     self.http_server.receiver(message).await;
+                    return
+                }
+
+                // Put requests can be cached as well. Same key + value put request
+                // does nothing but produce pointless load on the network.
+                if self.http_server.get_cached(&req).await.is_some() {
+                    debug!("Serving put request response for entry {:?} from cache", x);
+                    return
+                }
+
+                if let Err(e) = self.omni_paxos.append(req) {
+                    error!("Failed to append PUT request to replicated log: {:?}", e);
                 }
             }
             OpaxRequest::Delete(ref x) => {
-                let entry = OpaxRequest::Delete(x.to_owned());
-
-                if let Err(e) = self.omni_paxos.append(entry) {
-                    error!("Failed to append DELETE request to replicated log: {:?}", e);
-                }
+                let req = OpaxRequest::Delete(x.to_owned());
 
                 if ! self.http_client.quorum().await {
-                    let response = OpaxResponse::Blocked(req.to_owned());
-                    let message = OpaxMessage::APIResponse(response, Some(req));
+                    warn!("Cluster detected lost quorum");
+
+                    let resp = OpaxResponse::Blocked(req.to_owned());
+                    let message = OpaxMessage::api_response(req, resp);
                     
                     self.http_server.receiver(message).await;
+                    return
                 }
+
+                if self.http_server.get_cached(&req).await.is_some() {
+                    debug!("Serving delete request response for key {} from cache", x);
+                    return
+                }
+                
+                if let Err(e) = self.omni_paxos.append(req) {
+                    error!("Failed to append DELETE request to replicated log: {:?}", e);
+                }                    
             },
             OpaxRequest::Ping(p) => {
                 let r = self.http_client.ping_peer(self.http_server.node_id, p).await;
-                let response = OpaxResponse::Pong((p, r));
-                let message = OpaxMessage::APIResponse(response, Some(req.to_owned()));
+                let resp = OpaxResponse::Pong((p, r));
+                let message = OpaxMessage::api_response(req, resp);
                 
                 self.http_server.receiver(message).await;
             }
@@ -176,28 +252,41 @@ impl OpaxServer {
             }
         }
     }
+    async fn database_transaction(&mut self, req: OpaxRequest) {
+        let d = match self.database.action(&req, false) {
+            Ok(d) => d,
+            Err(e) => panic!("Database action failed: {}", e),
+        };
+        
+        // Update query response if present
+        let resp = match req {
+            OpaxRequest::Delete(_) => {
+                debug!("Deleted key: {} which had value: {:?}", d.key, d.overwritten_val);
+                OpaxResponse::Delete(d)
+            },
+            OpaxRequest::Put(_) => {
+                debug!("Added key: {} with val: {:?}, overwriting value: {:?}",
+                    d.key, d.value, d.overwritten_val);
+                OpaxResponse::Put(d)
+            },
+            OpaxRequest::Get(_) => panic!("Stupid developer issue: get request is not \
+                a DB transaction"),
+            OpaxRequest::Ping(_) => panic!("Stupid developer issue: DB doesn't do pings"),
+        };
 
-    async fn update_database(&self, decided_entries: Vec<LogEntry<OpaxRequest>>) {
+        // Dump cached responses for parts where it makes sense
+        self.http_server.wipe_cache(&req, &resp).await;
+
+        let message = OpaxMessage::api_response(req, resp);
+        self.http_server.receiver(message).await;
+    }
+    async fn update_database(&mut self, decided_entries: Vec<LogEntry<OpaxRequest>>) {
         for entry in decided_entries {
             match entry {
                 LogEntry::Decided(r) => {
                     debug!("Updating decided log entry to DB: {:?}", r);
 
-                    let d = match self.database.action(&r, false) {
-                        Ok(d) => d,
-                        Err(e) => panic!("Database action failed: {}", e),
-                    };
-                    
-                    // Update query response if present
-                    let response = match r {
-                        OpaxRequest::Get(_) => OpaxResponse::Get(d),
-                        OpaxRequest::Delete(_) => OpaxResponse::Delete(d),
-                        OpaxRequest::Put(_) => OpaxResponse::Put(d),
-                        OpaxRequest::Ping(_) => panic!("Stupid developer issue: don't log pings"),
-                    };
-
-                    let message = OpaxMessage::APIResponse(response, Some(r));
-                    self.http_server.receiver(message).await;
+                    self.database_transaction(r).await;
                 },
                 LogEntry::Undecided(r) => {
                     debug!("Ignoring database update from undecided log entry: {:?}", r);
@@ -209,32 +298,12 @@ impl OpaxServer {
                     debug!("Updating from snapshotted log entry to DB: {:?}", s);
 
                     for d in s.snapshot.deleted_keys {
-                        let req = OpaxRequest::Delete(d);
-                        let d = match self.database.action(&req, false) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Database action failed: {}", e);
-                                continue;
-                            },
-                        };
-
-                        debug!("Deleted key: {} which had value: {:?}", d.key, d.overwritten_val);
+                        self.database_transaction(OpaxRequest::Delete(d)).await;
                     }
 
                     for (k, v) in s.snapshot.snapshotted {
                         let entry = OpaxEntry { key: k, value: v};
-                        let req = OpaxRequest::Put(entry);
-
-                        let d = match self.database.action(&req, false) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                error!("Database action failed: {}", e);
-                                panic!("Unable to proceed, inconsistent replication.");
-                            },
-                        };
-
-                        debug!("Added key: {} with val: {}, overwriting value: {:?}",
-                            d.key, d.value.unwrap(), d.overwritten_val);
+                        self.database_transaction(OpaxRequest::Put(entry)).await;
                     }
                 },
                 LogEntry::StopSign(s, b) => {

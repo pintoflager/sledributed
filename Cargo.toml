@@ -1,0 +1,30 @@
+[package]
+name = "sledributed"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "1.0", features = ["backtrace"] }
+serde = { version = "1.0", features = ["derive"] }
+omnipaxos = { git = "https://github.com/haraldng/omnipaxos", features = ["serde", "macros"] }
+# omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "io-util", "time", "fs"] }
+toml = "0.8.0"
+serde_json = "1.0.107"
+sled = "0.34.7"
+commitlog = "0.2.0"
+zerocopy = "0.7.5"
+bincode = "1.3.3"
+axum = { version = "0.6.20", features = ["ws"] }
+tower = { version = "0.4.13", features = ["util", "timeout", "load-shed", "limit"] }
+futures-util = "0.3.28"
+# tower-http = { version = "0.4.4", features = ["add-extension", "auth", "compression-full", "limit", "trace"] }
+# tower-layer = "0.3.2"
+# http-body-util = { version = "0.1.0-rc.3" }
+# hyper = { version = "1.0.0-rc.4", features = ["client", "http1"] }
+# hyper-util = { git = "https://github.com/hyperium/hyper-util.git" }
+tokio-tungstenite = "0.20.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
